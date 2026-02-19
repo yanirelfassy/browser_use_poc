@@ -137,6 +137,107 @@ Delete `profile_id.txt` to force a fresh first-run flow.
 rm profile_id.txt
 ```
 
+## Handling sensitive data in forms
+
+After login, the agent may need to fill in sensitive data (account numbers, credit card details, routing numbers, etc.) on a page. There are two approaches, depending on your security requirements.
+
+### Option 1: `secrets` parameter (recommended for POC)
+
+Browser-Use Cloud provides a built-in `secrets` parameter on tasks. Secrets are redacted from logs and task history. The agent can reference them by name without the raw values appearing in output.
+
+```python
+task = client.tasks.create_task(
+    session_id=session.id,
+    task="Fill the account number field with secret 'account_number', "
+         "then fill the routing number with secret 'routing'.",
+    secrets={
+        "account_number": user_data["account_number"],
+        "routing": user_data["routing"],
+    },
+    llm="browser-use-llm",
+)
+result = task.complete()
+```
+
+This works with any dynamic field type — the agent figures out where each value goes based on the field labels. Fully automatic, no human-in-the-loop needed. The tradeoff: data flows through the LLM context (but is redacted from logs by Browser-Use Cloud).
+
+| Pros | Cons |
+|------|------|
+| Drop-in, works out of the box | Data passes through the LLM context |
+| Handles any field type dynamically | Relies on vendor redaction for log safety |
+| Fully automatic, multi-user ready | |
+
+### Option 2: CDP injection (recommended for production)
+
+For higher security requirements, inject values directly into the browser via Chrome DevTools Protocol. The LLM never sees the sensitive data at all.
+
+The flow is:
+
+1. **Agent navigates** to the target page (knows nothing about the data).
+2. **Agent identifies form fields** and returns their CSS selectors via `structured_output`.
+3. **Your backend injects** values directly into the browser via CDP — the LLM never sees them.
+4. **Agent continues** — clicks submit, confirms success.
+
+```python
+from pydantic import BaseModel
+from playwright.sync_api import sync_playwright
+
+# Step 1: Agent finds the form fields
+class FormField(BaseModel):
+    label: str
+    selector: str
+
+class FormFields(BaseModel):
+    fields: list[FormField]
+
+discover_task = client.tasks.create_task(
+    session_id=session.id,
+    task="Find all input fields on the current form. "
+         "Return each field's visible label and its CSS selector.",
+    schema=FormFields,
+    llm="browser-use-llm",
+)
+result = discover_task.complete()
+# Returns e.g.: [{"label": "Account Number", "selector": "#acct-input"}, ...]
+
+# Step 2: Inject sensitive values via CDP (LLM never sees them)
+browser_session = client.browsers.get_browser_session(session.id)
+
+with sync_playwright() as p:
+    browser = p.chromium.connect_over_cdp(browser_session.cdp_url)
+    page = browser.contexts[0].pages[0]
+
+    # Map your user's data to the discovered selectors
+    field_values = {
+        "Account Number": user_data["account_number"],
+        "Routing Number": user_data["routing"],
+    }
+    for field in result.parsed_output.fields:
+        if field.label in field_values:
+            page.fill(field.selector, field_values[field.label])
+
+# Step 3: Agent submits the form
+client.tasks.create_task(
+    session_id=session.id,
+    task="Click the submit button and confirm the operation succeeded.",
+    llm="browser-use-llm",
+).complete()
+```
+
+| Pros | Cons |
+|------|------|
+| Sensitive data never touches the LLM | More implementation effort |
+| Deterministic — no risk of filling wrong field | Requires Playwright as a dependency |
+| Full control over injection | Field discovery adds an extra agent step |
+
+### Which to use
+
+| Scenario | Recommendation |
+|----------|---------------|
+| POC / internal tools | `secrets` — simple, fast to implement |
+| Production with PII or financial data | CDP injection — data never leaves your server |
+| Regulatory requirements (PCI-DSS, SOC 2) | CDP injection — auditable, no third-party LLM exposure |
+
 ## Production considerations
 
 ### Session expiry
