@@ -1,0 +1,4 @@
+.env
+profile_id.txt
+__pycache__/
+*.pyc
